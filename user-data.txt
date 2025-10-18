@@ -1,0 +1,151 @@
+#!/bin/bash
+set -euxo pipefail
+
+# ---------- helpers ----------
+retry(){ n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep $((2**n)); done; }
+if command -v dnf >/dev/null 2>&1; then PM="dnf -y";
+elif command -v yum >/dev/null 2>&1; then PM="yum -y";
+else export DEBIAN_FRONTEND=noninteractive; apt-get update -y || true; PM="apt-get -y"; fi
+
+# ---------- 0) install minimum runtime ----------
+if [[ "$PM" =~ apt ]]; then retry apt-get update; retry $PM install nginx awscli python3-pip ca-certificates;
+else retry $PM install nginx awscli python3-pip; fi
+
+# ---------- 1) remove conflicting default configs (prevents :80 clashes) ----------
+mkdir -p /etc/nginx/conf.d.bak
+mv /etc/nginx/conf.d/*.conf /etc/nginx/conf.d.bak/ 2>/dev/null || true
+if [ -d /etc/nginx/sites-enabled ]; then
+  mkdir -p /etc/nginx/sites-enabled.bak
+  mv /etc/nginx/sites-enabled/* /etc/nginx/sites-enabled.bak/ 2>/dev/null || true
+fi
+
+# ---------- 2) ONE default server: health + SPA + proxy ----------
+cat >/etc/nginx/conf.d/site.conf <<'NGINX'
+server {
+  listen 80 default_server;
+  server_name _;
+
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # Health check for ALB
+  location = /healthz { return 200 "ok\n"; }
+
+  # SPA routing for React
+  location / { try_files $uri $uri/ /index.html; }
+
+  # Backend proxy to FastAPI on 127.0.0.1:9000
+  location /contact {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+
+  # (optional) security headers
+  add_header X-Content-Type-Options nosniff always;
+  add_header X-Frame-Options DENY always;
+  add_header Referrer-Policy no-referrer-when-downgrade always;
+  add_header Content-Security-Policy "default-src 'self'; object-src 'none'; frame-ancestors 'none';" always;
+}
+NGINX
+
+mkdir -p /usr/share/nginx/html
+nginx -t
+systemctl daemon-reload
+systemctl enable --now nginx
+
+# ---------- 3) frontend content ----------
+retry aws s3 sync s3://portfolio-artifacts-jerrychen5177/latest/ /usr/share/nginx/html/ --delete || true
+echo "ok" > /usr/share/nginx/html/healthz
+nginx -t && systemctl reload nginx
+
+# ---------- 4) backend code + dependencies ----------
+retry aws s3 sync s3://portfolio-artifacts-jerrychen5177/backend/latest/ /opt/app/ --delete || true
+retry pip3 install --upgrade pip
+[ -f /opt/app/requirements.txt ] && retry pip3 install -r /opt/app/requirements.txt || true
+retry pip3 install uvicorn fastapi python-dotenv "pydantic[email]" || true
+
+# ---------- 5) secrets from SSM Parameter Store ----------
+EMAIL_USER=$(aws ssm get-parameter --name "/portfolio/EMAIL_USER" --with-decryption --query "Parameter.Value" --output text || echo "")
+EMAIL_PASSWORD=$(aws ssm get-parameter --name "/portfolio/EMAIL_PASSWORD" --with-decryption --query "Parameter.Value" --output text || echo "")
+cat >/etc/portfolio.env <<EOF
+EMAIL_USER=${EMAIL_USER}
+EMAIL_PASSWORD=${EMAIL_PASSWORD}
+EOF
+chmod 600 /etc/portfolio.env
+
+# ---------- 6) systemd service for FastAPI ----------
+cat >/etc/systemd/system/contact.service <<'UNIT'
+[Unit]
+Description=FastAPI Contact Service
+After=network-online.target nginx.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+EnvironmentFile=/etc/portfolio.env
+WorkingDirectory=/opt/app
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 9000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now contact || true
+
+# ---------- 7) ensure SSM agent ----------
+systemctl enable --now amazon-ssm-agent || true
+
+# ---------- 9) CloudWatch Agent install + start ----------
+retry $PM install amazon-cloudwatch-agent || true
+
+cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'CFG'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/nginx/access.log",
+            "log_group_name": "/midterm/nginx/access",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "/var/log/nginx/error.log",
+            "log_group_name": "/midterm/nginx/error",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "/var/log/messages",
+            "log_group_name": "/midterm/system",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "/var/log/contact.log",
+            "log_group_name": "/midterm/contact",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    },
+    "force_flush_interval": 15
+  },
+  "metrics": {
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+      "disk": { "measurement": ["used_percent"], "metrics_collection_interval": 60, "resources": ["*"] },
+      "cpu":  { "measurement": ["cpu_usage_user","cpu_usage_idle","cpu_usage_iowait"], "metrics_collection_interval": 60 }
+    }
+  }
+}
+CFG
+
+# Start the agent
+systemctl enable --now amazon-cloudwatch-agent || true

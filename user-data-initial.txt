@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Detect package manager
+if command -v dnf >/dev/null 2>&1; then
+  PM="dnf -y"
+elif command -v yum >/dev/null 2>&1; then
+  PM="yum -y"
+else
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || true
+  PM="apt-get -y"
+fi
+
+retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep $((2**n)); done; }
+
+# Install nginx and awscli (with retries)
+if [[ "$PM" =~ apt ]]; then
+  retry apt-get update
+  retry $PM install nginx awscli ca-certificates
+else
+  retry $PM install nginx awscli
+fi
+
+# Guaranteed 200 health check FIRST
+echo "ok" > /usr/share/nginx/html/healthz || true
+cat >/etc/nginx/conf.d/00-healthz.conf <<'EOF'
+server {
+  listen 80 default_server;
+  server_name _;
+  root /usr/share/nginx/html;
+  location = /healthz { return 200 "ok\n"; }
+  location / { try_files $uri $uri/ /index.html; }
+}
+EOF
+nginx -t
+systemctl enable --now nginx
+
+# Pull site (non-fatal if it fails; health stays green)
+aws s3 sync s3://portfolio-artifacts/latest/ /usr/share/nginx/html/ || true
+
+# Ensure SSM agent
+systemctl enable --now amazon-ssm-agent || true
